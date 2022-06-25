@@ -41,7 +41,7 @@ common lang
 library
     import: lang
     exposed-modules:
-      MintingCollection.Main
+      MintingCollection.NFT
     build-depends:
       base >= 4.9 && < 5,
       aeson -any,
