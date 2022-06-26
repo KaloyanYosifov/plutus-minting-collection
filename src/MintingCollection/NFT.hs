@@ -35,52 +35,45 @@ import           Prelude                  (IO, Semigroup (..), Show (..),
 import           Text.Printf              (printf)
 import           Wallet.Emulator.Wallet
 
-{-# INLINABLE mkPolicy #-}
-mkPolicy :: TxOutRef -> TokenName -> () -> ScriptContext -> Bool
-mkPolicy oref tn () ctx = traceIfFalse "UTxO not consumed"   hasUTxO           &&
-                          traceIfFalse "wrong amount minted" checkMintedAmount
-  where
-    info :: TxInfo
-    info = scriptContextTxInfo ctx
+{-# INLINEABLE mkControlPolicy #-}
+mkControlPolicy :: TxOutRef -> () -> ScriptContext -> Bool
+mkControlPolicy oref _ ctx = hasUtxo
+    where
+        txInfo :: TxInfo
+        txInfo = scriptContextTxInfo ctx
 
-    hasUTxO :: Bool
-    hasUTxO = any (\i -> txInInfoOutRef i == oref) $ txInfoInputs info
+        hasUtxo :: Bool
+        hasUtxo = any (\i -> txInInfoOutRef i == oref) $ txInfoInputs txInfo
 
-    checkMintedAmount :: Bool
-    checkMintedAmount = case flattenValue (txInfoMint  info) of
-        [(cs, tn', amt)] -> cs  == ownCurrencySymbol ctx && tn' == tn && amt == 1
-        _                -> False
-
-policy :: TxOutRef -> TokenName -> Scripts.MintingPolicy
-policy oref tn = mkMintingPolicyScript $
-    $$(PlutusTx.compile [|| \oref' tn' -> Scripts.wrapMintingPolicy $ mkPolicy oref' tn' ||])
+controlPolicyInstance :: TxOutRef -> Scripts.MintingPolicy
+controlPolicyInstance oref = mkMintingPolicyScript $
+    $$(PlutusTx.compile [|| Scripts.wrapMintingPolicy . mkControlPolicy ||])
     `PlutusTx.applyCode`
     PlutusTx.liftCode oref
-    `PlutusTx.applyCode`
-    PlutusTx.liftCode tn
 
-curSymbol :: TxOutRef -> TokenName -> CurrencySymbol
-curSymbol oref tn = scriptCurrencySymbol $ policy oref tn
+controlPolicyCurSymbol :: TxOutRef -> CurrencySymbol
+controlPolicyCurSymbol = scriptCurrencySymbol . controlPolicyInstance
 
-type NFTSchema = Endpoint "mint" TokenName
 
-mint :: TokenName -> Contract w NFTSchema Text ()
-mint tn = do
+type NFTSchema = Endpoint "initControlPolicy" TokenName
+
+initControlPolicy :: Contract w NFTSchema Text ()
+initControlPolicy = do
     pkh <- Contract.ownPaymentPubKeyHash
     utxos <- Contract.utxosAt (PlutusAddress.pubKeyHashAddress (unPaymentPubKeyHash pkh))
     case Map.keys utxos of
         []       -> Contract.logError @String "no utxo found"
         oref : _ -> do
-            let val     = Value.singleton (curSymbol oref tn) tn 1
-                lookups = Constraints.mintingPolicy (policy oref tn) <> Constraints.unspentOutputs utxos
-                tx      = Constraints.mustMintValue val <> Constraints.mustSpendPubKeyOutput oref
+            let controlToken     = Value.singleton (controlPolicyCurSymbol oref) "" 1
+                lookups = Constraints.mintingPolicy (controlPolicyInstance oref) <> Constraints.unspentOutputs utxos
+                tx      = Constraints.mustMintValue controlToken <> Constraints.mustSpendPubKeyOutput oref
             ledgerTx <- submitTxConstraintsWith @Void lookups tx
             void $ awaitTxConfirmed $ getCardanoTxId ledgerTx
-            Contract.logInfo @String $ printf "forged %s" (show val)
+            Contract.logInfo @String $ printf "forged %s" (show controlToken)
 
 endpoints :: Contract () NFTSchema Text ()
-endpoints = mint' >> endpoints
-        where mint' = awaitPromise $ endpoint @"mint" mint
+endpoints = initControlPolicy' >> endpoints
+        where initControlPolicy' = awaitPromise $ endpoint @"initControlPolicy" $ const initControlPolicy
 
 mkSchemaDefinitions ''NFTSchema
 
@@ -92,6 +85,6 @@ test = runEmulatorTraceIO $ do
         w2 = knownWallet 2
     h1 <- activateContractWallet w1 endpoints
     h2 <- activateContractWallet w2 endpoints
-    callEndpoint @"mint" h1 "test"
-    callEndpoint @"mint" h2 "test3"
+    callEndpoint @"initControlPolicy" h1 "test"
+    callEndpoint @"initControlPolicy" h2 "test3"
     void $ Emulator.waitNSlots 1
